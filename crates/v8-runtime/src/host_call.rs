@@ -22,7 +22,10 @@ static SYNCRPC_LAT: std::sync::OnceLock<std::sync::Mutex<(u64, u64, u64)>> =
     std::sync::OnceLock::new();
 
 fn syncrpc_lat_enabled() -> bool {
-    std::env::var("AGENTOS_SYNCRPC_LAT").as_deref() == Ok("1")
+    // The sidecar reads this switch on every sync RPC, and the environment of
+    // the process does not change after start.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AGENTOS_SYNCRPC_LAT").as_deref() == Ok("1"))
 }
 
 fn record_syncrpc_lat(ns: u64) {
@@ -63,7 +66,10 @@ static SYNC_BRIDGE_CALL_METHODS: std::sync::OnceLock<std::sync::Mutex<HashMap<u6
     std::sync::OnceLock::new();
 
 fn sync_bridge_host_phases_enabled() -> bool {
-    std::env::var("AGENTOS_SYNC_BRIDGE_HOST_PHASES").as_deref() == Ok("1")
+    // The sidecar reads this switch on every sync RPC, and the environment of
+    // the process does not change after start.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AGENTOS_SYNC_BRIDGE_HOST_PHASES").as_deref() == Ok("1"))
 }
 
 pub(crate) fn record_sync_bridge_host_phase(method: &str, stage: &str, elapsed: Duration) {

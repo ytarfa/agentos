@@ -1,9 +1,10 @@
 use super::vfs::{
-    normalize_path, MemoryFileSystem, VfsError, VfsResult, VirtualDirEntry, VirtualFileSystem,
+    normalize_path, normalize_path_cow, MemoryFileSystem, VfsError, VfsResult, VirtualDirEntry, VirtualFileSystem,
     VirtualStat, VirtualUtimeSpec,
 };
 use base64::Engine;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Mutex;
 
 const MAX_SNAPSHOT_DEPTH: usize = 1024;
 const OVERLAY_METADATA_ROOT: &str = "/.agentos-overlay";
@@ -16,11 +17,48 @@ pub enum OverlayMode {
     ReadOnly,
 }
 
+const PATH_FACT_CACHE_MAX_ENTRIES: usize = 4096;
+const PATH_FACT_CACHE_MAX_PATH_LENGTH: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+enum PathFact {
+    TouchesInternalMetadata,
+    WhitedOut,
+}
+
+/// Answers that depend only on the path namespace of the layers. The cache is
+/// valid for one namespace generation, so a create, remove, rename, link or
+/// symlink in a layer discards all the entries.
+#[derive(Debug, Default)]
+struct PathFactCache {
+    generation: u64,
+    touches_internal_metadata: HashMap<String, bool>,
+    whited_out: HashMap<String, bool>,
+}
+
+impl PathFactCache {
+    fn facts(&mut self, fact: PathFact) -> &mut HashMap<String, bool> {
+        match fact {
+            PathFact::TouchesInternalMetadata => &mut self.touches_internal_metadata,
+            PathFact::WhitedOut => &mut self.whited_out,
+        }
+    }
+
+    fn enter_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.generation = generation;
+            self.touches_internal_metadata.clear();
+            self.whited_out.clear();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct OverlayFileSystem {
     lowers: Vec<MemoryFileSystem>,
     upper: Option<MemoryFileSystem>,
     writes_locked: bool,
+    path_facts: Mutex<PathFactCache>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +106,7 @@ impl OverlayFileSystem {
             lowers: effective_lowers,
             upper,
             writes_locked: matches!(mode, OverlayMode::ReadOnly),
+            path_facts: Mutex::default(),
         }
     }
 
@@ -81,7 +120,43 @@ impl OverlayFileSystem {
             lowers: effective_lowers,
             upper: Some(upper),
             writes_locked: false,
+            path_facts: Mutex::default(),
         }
+    }
+
+    /// Changes when the path namespace of a layer changes. Each layer
+    /// generation is unique and grows, so the maximum grows on every change.
+    fn namespace_generation(&self) -> u64 {
+        self.lowers
+            .iter()
+            .chain(self.upper.as_ref())
+            .map(MemoryFileSystem::namespace_generation)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn cached_path_fact(&self, fact: PathFact, path: &str, compute: impl FnOnce() -> bool) -> bool {
+        if path.len() > PATH_FACT_CACHE_MAX_PATH_LENGTH {
+            return compute();
+        }
+        let generation = self.namespace_generation();
+        if let Ok(mut cache) = self.path_facts.lock() {
+            cache.enter_generation(generation);
+            if let Some(value) = cache.facts(fact).get(path) {
+                return *value;
+            }
+        }
+        // `compute` reads other facts, so the lock must not be held here.
+        let value = compute();
+        if let Ok(mut cache) = self.path_facts.lock() {
+            cache.enter_generation(generation);
+            let facts = cache.facts(fact);
+            if facts.len() >= PATH_FACT_CACHE_MAX_ENTRIES {
+                facts.clear();
+            }
+            facts.insert(path.to_owned(), value);
+        }
+        value
     }
 
     pub fn lock_writes(&mut self) {
@@ -294,9 +369,10 @@ impl OverlayFileSystem {
     }
 
     fn is_internal_metadata_path(path: &str) -> bool {
-        let normalized = Self::normalized(path);
-        normalized == OVERLAY_METADATA_ROOT
-            || normalized.starts_with(&(String::from(OVERLAY_METADATA_ROOT) + "/"))
+        let normalized = normalize_path_cow(path);
+        normalized
+            .strip_prefix(OVERLAY_METADATA_ROOT)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     }
 
     /// Returns true if `path`, or the location it resolves to through symlinks,
@@ -310,6 +386,12 @@ impl OverlayFileSystem {
     /// resurrecting a deleted lower-layer file). Resolving before the check
     /// closes that hole while leaving ordinary symlinks unaffected.
     fn touches_internal_metadata(&self, path: &str) -> bool {
+        self.cached_path_fact(PathFact::TouchesInternalMetadata, path, || {
+            self.compute_touches_internal_metadata(path)
+        })
+    }
+
+    fn compute_touches_internal_metadata(&self, path: &str) -> bool {
         if Self::is_internal_metadata_path(path) {
             return true;
         }
@@ -687,7 +769,9 @@ impl OverlayFileSystem {
     }
 
     fn is_whited_out(&self, path: &str) -> bool {
-        self.marker_exists(OverlayMarkerKind::Whiteout, path)
+        self.cached_path_fact(PathFact::WhitedOut, path, || {
+            self.marker_exists(OverlayMarkerKind::Whiteout, path)
+        })
     }
 
     fn ensure_metadata_directories_in_upper(&mut self, path: &str) -> VfsResult<()> {

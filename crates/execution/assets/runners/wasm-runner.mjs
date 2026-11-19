@@ -708,6 +708,7 @@ let syncRpcResponseBuffer = '';
 const spawnedChildren = new Map();
 const spawnedChildrenById = new Map();
 let nextBlockingChildPumpIndex = 0;
+let idleChildPumpSweeps = 0;
 let nextSyntheticChildPid = 0x40000000;
 const syntheticFdEntries = new Map();
 const runnerCloexecFds = new Set();
@@ -1406,6 +1407,31 @@ const KERNEL_STDIN_WOULD_BLOCK = Symbol('kernel-stdin-would-block');
 // While one is active, return to the child event pump frequently enough to
 // preserve the concurrent progress Linux gives separately scheduled processes.
 const SPAWNED_CHILD_WAIT_SLICE_MS = 10;
+// child_process.poll never parks in the sidecar, so a parent that only waits
+// for its children sends poll and signal-drain requests without a pause. Those
+// requests compete with the requests of the children for the one dispatcher.
+// When the sidecar enables the park, the parent sleeps between sweeps after a
+// few sweeps without progress. An event that only this parent can pull then
+// waits for the end of that sleep, so the park is off by default.
+const IDLE_CHILD_PUMP_PARK_ENABLED =
+  typeof __agentOSWasmIdleChildPumpPark === 'boolean' && __agentOSWasmIdleChildPumpPark;
+const IDLE_CHILD_PUMP_SPIN_SWEEPS = 4;
+const IDLE_CHILD_PUMP_PARK_MS = [0.25, 0.5, 1];
+const IDLE_CHILD_PUMP_RPC_METHODS = new Set(['child_process.poll', 'process.take_signal']);
+
+function parkIdleChildPump(waitMs) {
+  if (!IDLE_CHILD_PUMP_PARK_ENABLED) {
+    return;
+  }
+  idleChildPumpSweeps += 1;
+  const step = idleChildPumpSweeps - IDLE_CHILD_PUMP_SPIN_SWEEPS;
+  if (step <= 0) {
+    return;
+  }
+  const parkMs =
+    IDLE_CHILD_PUMP_PARK_MS[Math.min(step, IDLE_CHILD_PUMP_PARK_MS.length) - 1];
+  Atomics.wait(syntheticWaitArray, 0, 0, Math.min(waitMs, parkMs));
+}
 
 function hasActiveSpawnedChildren() {
   for (const record of spawnedChildren.values()) {
@@ -3953,12 +3979,17 @@ function finalizeChildExit(record, exitCode, signal, coreDumped = false) {
 
 function pollChildEvent(record, waitMs) {
   if (Array.isArray(record?.pendingEvents) && record.pendingEvents.length > 0) {
+    idleChildPumpSweeps = 0;
     return record.pendingEvents.shift() ?? null;
   }
   if (record?.synthetic) {
     return null;
   }
-  return callSyncRpc('child_process.poll', [record.childId, waitMs]);
+  const event = callSyncRpc('child_process.poll', [record.childId, waitMs]);
+  if (event) {
+    idleChildPumpSweeps = 0;
+  }
+  return event;
 }
 
 function isChildProcessGoneError(error) {
@@ -4358,6 +4389,21 @@ function pumpSpawnedChildren(waitMs) {
       }
     }
   }
+  if (progressed) {
+    idleChildPumpSweeps = 0;
+  } else if (boundedWaitMs > 0) {
+    parkIdleChildPump(boundedWaitMs);
+  }
+  return progressed;
+}
+
+// A caller that repeats waitpid(WNOHANG) without other work is the same idle
+// wait as a blocking waitpid, so it gets the same pause between sweeps.
+function pumpSpawnedChildrenForNonBlockingWait() {
+  const progressed = pumpSpawnedChildren(0);
+  if (!progressed && hasActiveSpawnedChildren()) {
+    parkIdleChildPump(SPAWNED_CHILD_WAIT_SLICE_MS);
+  }
   return progressed;
 }
 
@@ -4516,6 +4562,10 @@ const wasmBlockedSignals = new Set(initialWasmSignalMask);
 let activeSpawnCallContext = null;
 
 function callSyncRpc(method, args = []) {
+  // Other requests show that the caller does more than wait for children.
+  if (!IDLE_CHILD_PUMP_RPC_METHODS.has(method)) {
+    idleChildPumpSweeps = 0;
+  }
   if (
     globalThis.__agentOSSyncRpc &&
     typeof globalThis.__agentOSSyncRpc.callSync === 'function'
@@ -7300,7 +7350,7 @@ const hostProcessImport = {
                 // children one zero-time service sweep so a selected child can
                 // consume pipeline data produced by a sibling, then re-check
                 // the selected set before reporting that no status is ready.
-                pumpSpawnedChildren(0);
+                pumpSpawnedChildrenForNonBlockingWait();
                 const readyRecord = records.find(
                   (record) => typeof record.exitStatus === 'number',
                 );
@@ -7415,7 +7465,7 @@ const hostProcessImport = {
                 // that Linux processes receive independently of waitpid. It
                 // does not wait for an event, and only a matching child can be
                 // reaped by this call.
-                pumpSpawnedChildren(0);
+                pumpSpawnedChildrenForNonBlockingWait();
                 const readyRecord = records.find(
                   (record) => typeof record.exitStatus === 'number',
                 );
@@ -7554,7 +7604,7 @@ const hostProcessImport = {
                 if (writeGuestUint32(retStatusPtr, 0) !== WASI_ERRNO_SUCCESS) {
                   return WASI_ERRNO_FAULT;
                 }
-                pumpSpawnedChildren(0);
+                pumpSpawnedChildrenForNonBlockingWait();
                 const readyRecord = records.find(
                   (record) => typeof record.rawWaitStatus === 'number',
                 );

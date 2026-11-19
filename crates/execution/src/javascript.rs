@@ -185,7 +185,10 @@ static SYNC_BRIDGE_REQUEST_ENQUEUED: OnceLock<Mutex<HashMap<u64, (String, Instan
     OnceLock::new();
 
 fn sync_bridge_phases_enabled() -> bool {
-    std::env::var("AGENTOS_SYNC_BRIDGE_PHASES").as_deref() == Ok("1")
+    // The sidecar reads this switch on every sync RPC, and the environment of
+    // the process does not change after start.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AGENTOS_SYNC_BRIDGE_PHASES").as_deref() == Ok("1"))
 }
 
 fn record_sync_bridge_phase(method: &str, stage: &str, elapsed: Duration) {

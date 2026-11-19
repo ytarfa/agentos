@@ -2845,8 +2845,13 @@ where
                                         | ActiveExecutionEvent::Exited(_),
                                     ) => false,
                                     // The parent's poll queues every supervisor-owned event, but a
-                                    // JavaScript child can also expose one before the parent polls.
-                                    None => child.runtime == GuestRuntimeKind::JavaScript,
+                                    // child can also expose one before the parent polls. A
+                                    // WebAssembly child sends one request for each syscall, so
+                                    // it must not wait for the next poll of its parent.
+                                    None => matches!(
+                                        child.runtime,
+                                        GuestRuntimeKind::JavaScript | GuestRuntimeKind::WebAssembly
+                                    ),
                                 }
                             }),
                         )
@@ -9261,28 +9266,10 @@ where
                 ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
                     let mut current_child_path = current_process_path.to_vec();
                     current_child_path.push(child_process_id);
-                    let requires_owned_supervisor =
-                        javascript_rpc_requires_owned_supervisor(&request.method);
-                    if preserve_pull_owned_events && !requires_owned_supervisor {
-                        let Some(mut vm) = self.vms.get_mut(vm_id) else {
-                            return Ok(Value::Null);
-                        };
-                        let Some(parent) = Self::descendant_parent_process_mut(
-                            &mut vm,
-                            process_id,
-                            current_process_path,
-                        ) else {
-                            return Ok(Value::Null);
-                        };
-                        let Some(child) = parent.child_processes.get_mut(child_process_id) else {
-                            return Ok(Value::Null);
-                        };
-                        child.requeue_pending_execution_event(PolledExecutionEvent {
-                            event: ActiveExecutionEvent::JavascriptSyncRpcRequest(request),
-                            reservation,
-                        })?;
-                        return Ok(Value::Null);
-                    }
+                    // A pull-driven WebAssembly parent owns only the stream and
+                    // exit events of this child. The supervisor services the
+                    // sync RPCs, so a child syscall does not wait for the next
+                    // child_process.poll of its parent.
                     if let Some(services) = owned_javascript_services.as_deref_mut() {
                         let Some((connection_id, session_id, vm)) =
                             self.vms.get(vm_id).and_then(|state| {

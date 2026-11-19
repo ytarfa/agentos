@@ -14,9 +14,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const JS_BRIDGE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -69,8 +70,40 @@ impl<B> FileSystemPluginFactory<MountPluginContext<B>> for JsBridgeMountPlugin {
     }
 }
 
+/// Environment variable that sets the lifetime, in milliseconds, of cached
+/// `stat`, `lstat`, `realpath` and `exists` answers. Unset or `0` disables the
+/// cache.
+const JS_BRIDGE_ATTR_CACHE_ENV: &str = "AGENTOS_JS_BRIDGE_ATTR_CACHE_MS";
+const JS_BRIDGE_ATTR_CACHE_MAX_ENTRIES: usize = 65_536;
+
+#[derive(Clone)]
+enum CachedAttr {
+    Stat(VirtualStat),
+    Path(String),
+    Missing(VfsError),
+}
+
+/// Short-lived metadata cache for one js_bridge mount. The kernel resolves the
+/// subject of each guest syscall through `realpath` and `stat`, so one file
+/// access repeats the same host callbacks dozens of times. A local mutation
+/// clears the cache; the lifetime bounds staleness for host-side changes.
+#[derive(Default)]
+struct AttrCache {
+    entries: HashMap<(&'static str, String), (Instant, CachedAttr)>,
+}
+
+fn attr_cache_ttl() -> Option<Duration> {
+    std::env::var(JS_BRIDGE_ATTR_CACHE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+}
+
 #[derive(Clone)]
 struct JsBridgeFilesystem {
+    attr_cache: Arc<Mutex<AttrCache>>,
+    attr_cache_ttl: Option<Duration>,
     requests: crate::state::SharedSidecarRequestClient,
     ownership: OwnershipScope,
     mount_id: String,
@@ -86,11 +119,69 @@ impl JsBridgeFilesystem {
         max_read_bytes: Option<usize>,
     ) -> Self {
         Self {
+            attr_cache: Arc::new(Mutex::new(AttrCache::default())),
+            attr_cache_ttl: attr_cache_ttl(),
             requests,
             ownership,
             mount_id,
             next_call_id: Arc::new(AtomicU64::new(1)),
             max_read_bytes,
+        }
+    }
+
+    fn cached_attr(&self, operation: &'static str, path: &str) -> Option<CachedAttr> {
+        let ttl = self.attr_cache_ttl?;
+        let cache = self.attr_cache.lock().ok()?;
+        let (at, attr) = cache.entries.get(&(operation, path.to_owned()))?;
+        (at.elapsed() < ttl).then(|| attr.clone())
+    }
+
+    fn store_attr(&self, operation: &'static str, path: &str, attr: CachedAttr) {
+        if self.attr_cache_ttl.is_none() {
+            return;
+        }
+        if let Ok(mut cache) = self.attr_cache.lock() {
+            if cache.entries.len() >= JS_BRIDGE_ATTR_CACHE_MAX_ENTRIES {
+                cache.entries.clear();
+            }
+            cache
+                .entries
+                .insert((operation, path.to_owned()), (Instant::now(), attr));
+        }
+    }
+
+    fn invalidate_attrs(&self) {
+        if self.attr_cache_ttl.is_none() {
+            return;
+        }
+        if let Ok(mut cache) = self.attr_cache.lock() {
+            cache.entries.clear();
+        }
+    }
+
+    fn cached_stat(&self, operation: &'static str, path: &str) -> VfsResult<VirtualStat> {
+        match self.cached_attr(operation, path) {
+            Some(CachedAttr::Stat(stat)) => return Ok(stat),
+            Some(CachedAttr::Missing(error)) => return Err(error),
+            _ => {}
+        }
+        let fetched = self
+            .request_path(operation, path, json!({ "path": path }))
+            .and_then(|result| {
+                self.parse_required::<JsBridgeVirtualStat>(operation, path, result)
+            });
+        match fetched {
+            Ok(stat) => {
+                let stat: VirtualStat = stat.into();
+                self.store_attr(operation, path, CachedAttr::Stat(stat.clone()));
+                Ok(stat)
+            }
+            Err(error) => {
+                if error.code() == "ENOENT" {
+                    self.store_attr(operation, path, CachedAttr::Missing(error.clone()));
+                }
+                Err(error)
+            }
         }
     }
 
@@ -428,6 +519,7 @@ impl VirtualFileSystem for JsBridgeFilesystem {
 
     fn write_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
         let content = BASE64_STANDARD.encode(content.into());
+        self.invalidate_attrs();
         self.request_path(
             "writeFile",
             path,
@@ -440,11 +532,13 @@ impl VirtualFileSystem for JsBridgeFilesystem {
     }
 
     fn create_dir(&mut self, path: &str) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path("createDir", path, json!({ "path": path }))?;
         Ok(())
     }
 
     fn mkdir(&mut self, path: &str, recursive: bool) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path(
             "mkdir",
             path,
@@ -461,8 +555,25 @@ impl VirtualFileSystem for JsBridgeFilesystem {
         // `existsSync` reports any failure as `false`, so a failed host callback
         // (EIO, timeout) still answers `false`. Log it here so an I/O failure is
         // not mistaken for a missing file.
+        match self.cached_attr("stat", path) {
+            Some(CachedAttr::Stat(_)) => return true,
+            Some(CachedAttr::Missing(_)) => return false,
+            _ => {}
+        }
         match self.request_path("exists", path, json!({ "path": path })) {
-            Ok(Some(Value::Bool(exists))) => exists,
+            Ok(Some(Value::Bool(exists))) => {
+                if !exists {
+                    self.store_attr(
+                        "stat",
+                        path,
+                        CachedAttr::Missing(VfsError::new(
+                            "ENOENT",
+                            format!("no such file or directory, stat '{path}'"),
+                        )),
+                    );
+                }
+                exists
+            }
             Ok(other) => {
                 tracing::warn!(
                     mount_id = %self.mount_id,
@@ -486,25 +597,23 @@ impl VirtualFileSystem for JsBridgeFilesystem {
     }
 
     fn stat(&mut self, path: &str) -> VfsResult<VirtualStat> {
-        let stat: JsBridgeVirtualStat = self.parse_required(
-            "stat",
-            path,
-            self.request_path("stat", path, json!({ "path": path }))?,
-        )?;
-        Ok(stat.into())
+        self.cached_stat("stat", path)
     }
 
     fn remove_file(&mut self, path: &str) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path("removeFile", path, json!({ "path": path }))?;
         Ok(())
     }
 
     fn remove_dir(&mut self, path: &str) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path("removeDir", path, json!({ "path": path }))?;
         Ok(())
     }
 
     fn rename(&mut self, old_path: &str, new_path: &str) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path(
             "rename",
             old_path,
@@ -529,14 +638,30 @@ impl VirtualFileSystem for JsBridgeFilesystem {
         if path.is_empty() || path == "/" {
             return Ok(String::from("/"));
         }
-        self.parse_required(
-            "realpath",
-            path,
-            self.request_path("realpath", path, json!({ "path": path }))?,
-        )
+        match self.cached_attr("realpath", path) {
+            Some(CachedAttr::Path(resolved)) => return Ok(resolved),
+            Some(CachedAttr::Missing(error)) => return Err(error),
+            _ => {}
+        }
+        let fetched = self
+            .request_path("realpath", path, json!({ "path": path }))
+            .and_then(|result| self.parse_required::<String>("realpath", path, result));
+        match fetched {
+            Ok(resolved) => {
+                self.store_attr("realpath", path, CachedAttr::Path(resolved.clone()));
+                Ok(resolved)
+            }
+            Err(error) => {
+                if error.code() == "ENOENT" {
+                    self.store_attr("realpath", path, CachedAttr::Missing(error.clone()));
+                }
+                Err(error)
+            }
+        }
     }
 
     fn symlink(&mut self, target: &str, link_path: &str) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path(
             "symlink",
             link_path,
@@ -557,15 +682,11 @@ impl VirtualFileSystem for JsBridgeFilesystem {
     }
 
     fn lstat(&self, path: &str) -> VfsResult<VirtualStat> {
-        let stat: JsBridgeVirtualStat = self.parse_required(
-            "lstat",
-            path,
-            self.request_path("lstat", path, json!({ "path": path }))?,
-        )?;
-        Ok(stat.into())
+        self.cached_stat("lstat", path)
     }
 
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path(
             "link",
             old_path,
@@ -578,6 +699,7 @@ impl VirtualFileSystem for JsBridgeFilesystem {
     }
 
     fn chmod(&mut self, path: &str, mode: u32) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path(
             "chmod",
             path,
@@ -600,6 +722,7 @@ impl VirtualFileSystem for JsBridgeFilesystem {
         gid: u32,
         follow_symlinks: bool,
     ) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path(
             "chown",
             path,
@@ -614,6 +737,7 @@ impl VirtualFileSystem for JsBridgeFilesystem {
     }
 
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path(
             "utimes",
             path,
@@ -627,6 +751,7 @@ impl VirtualFileSystem for JsBridgeFilesystem {
     }
 
     fn truncate(&mut self, path: &str, length: u64) -> VfsResult<()> {
+        self.invalidate_attrs();
         self.request_path(
             "truncate",
             path,
@@ -653,6 +778,7 @@ impl VirtualFileSystem for JsBridgeFilesystem {
 
     fn pwrite(&mut self, path: &str, content: impl Into<Vec<u8>>, offset: u64) -> VfsResult<()> {
         let content = BASE64_STANDARD.encode(content.into());
+        self.invalidate_attrs();
         self.request_path(
             "pwrite",
             path,

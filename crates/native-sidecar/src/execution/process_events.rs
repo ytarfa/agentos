@@ -519,7 +519,10 @@ fn record_execute_response_to_exit(vm_id: &str, process_id: &str) {
 }
 
 pub(super) fn sync_rpc_trace_enabled() -> bool {
-    std::env::var("AGENTOS_SYNC_RPC_TRACE").as_deref() == Ok("1")
+    // The sidecar reads this switch on every sync RPC, and the environment of
+    // the process does not change after start.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AGENTOS_SYNC_RPC_TRACE").as_deref() == Ok("1"))
 }
 
 pub(super) fn record_sync_rpc(method: &str) {

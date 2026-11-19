@@ -2566,7 +2566,7 @@ where
         vm.kernel.set_loopback_exempt_ports(loopback_exempt_ports);
         vm.configuration = VmConfiguration {
             defaults_profile: vm.configuration.defaults_profile,
-            mounts: effective_mounts.clone(),
+            mounts: Arc::new(effective_mounts.clone()),
             software: payload.software.clone(),
             permissions: configured_permissions.clone(),
             module_access_cwd: payload.module_access_cwd.clone(),
@@ -2801,7 +2801,7 @@ where
             max_pread_bytes: vm.kernel.resource_limits().max_pread_bytes,
         };
         mount_leaf_descriptors(&mount_plugins, vm, &new_mounts, mount_context)?;
-        vm.configuration.mounts.extend(new_mounts);
+        Arc::make_mut(&mut vm.configuration.mounts).extend(new_mounts);
         vm.package_descriptors
             .push((payload.package_id.clone(), descriptor.clone()));
         vm.runtime_linked_package_ids
@@ -2927,8 +2927,7 @@ where
                     .map_err(kernel_error)?;
             }
         }
-        vm.configuration
-            .mounts
+        Arc::make_mut(&mut vm.configuration.mounts)
             .retain(|mount| !target_paths.contains(&mount.guest_path));
         vm.package_descriptors
             .retain(|(package_id, _)| package_id != &payload.package_id);
@@ -3749,7 +3748,7 @@ where
 {
     // Parse and validate the entire desired set before changing the live view.
     let prepared = prepare_mount_descriptors(mount_plugins, mounts)?;
-    let mut existing_mounts = vm.configuration.mounts.clone();
+    let mut existing_mounts = vm.configuration.mounts.to_vec();
     existing_mounts.sort_by_key(|mount| std::cmp::Reverse(mount_path_depth(&mount.guest_path)));
     let mut detached = Vec::with_capacity(existing_mounts.len());
     for mount in &existing_mounts {
@@ -4050,7 +4049,7 @@ where
 {
     // Nested leaves must be detached before their parents. In particular, npm
     // workspace packages are explicit child mounts below `/node_modules`.
-    let mut existing_mounts = vm.configuration.mounts.clone();
+    let mut existing_mounts = vm.configuration.mounts.to_vec();
     existing_mounts.sort_by_key(|mount| std::cmp::Reverse(mount_path_depth(&mount.guest_path)));
     for existing in existing_mounts {
         match vm
