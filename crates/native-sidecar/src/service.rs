@@ -7642,7 +7642,7 @@ mod prepared_request_tests {
             .iter()
             .any(|mount| mount.path == "/replacement-mount"));
         assert_eq!(
-            sidecar.vms.get(&vm_id).unwrap().configuration.mounts,
+            *sidecar.vms.get(&vm_id).unwrap().configuration.mounts,
             payload.mounts
         );
         assert_eq!(sidecar.vms.get(&vm_id).unwrap().guest_env, prior_guest_env);
@@ -7727,8 +7727,7 @@ mod prepared_request_tests {
                         MountOptions::new("operator-test"),
                     )
                     .unwrap();
-                vm.configuration
-                    .mounts
+                Arc::make_mut(&mut vm.configuration.mounts)
                     .push(crate::protocol::MountDescriptor {
                         guest_path: path.into(),
                         guest_source: String::from("operator-test"),

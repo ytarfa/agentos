@@ -1055,7 +1055,8 @@ pub(crate) struct SessionState {
 #[derive(Debug, Clone)]
 pub(crate) struct VmConfiguration {
     pub(crate) defaults_profile: vm_config::VmDefaultsProfile,
-    pub(crate) mounts: Vec<MountDescriptor>,
+    /// Shared so that each sync RPC can take a snapshot without a deep copy.
+    pub(crate) mounts: Arc<Vec<MountDescriptor>>,
     pub(crate) software: Vec<SoftwareDescriptor>,
     pub(crate) permissions: PermissionsPolicy,
     pub(crate) module_access_cwd: Option<String>,
@@ -1074,7 +1075,7 @@ impl Default for VmConfiguration {
     fn default() -> Self {
         Self {
             defaults_profile: vm_config::VmDefaultsProfile::Secure,
-            mounts: Vec::new(),
+            mounts: Arc::new(Vec::new()),
             software: Vec::new(),
             permissions: agentos_native_sidecar_core::permissions::deny_all_policy(),
             module_access_cwd: None,
@@ -1870,7 +1871,7 @@ pub(crate) struct JavascriptSocketPathContext {
     pub(crate) unix_socket_host_dir: PathBuf,
     pub(crate) unix_bound_addresses: GuestUnixAddressRegistry,
     pub(crate) host_net_transfer_descriptions: HostNetTransferDescriptionRegistry,
-    pub(crate) mounts: Vec<MountDescriptor>,
+    pub(crate) mounts: Arc<Vec<MountDescriptor>>,
     pub(crate) listen_policy: VmListenPolicy,
     pub(crate) loopback_exempt_ports: BTreeSet<u16>,
     pub(crate) tcp_loopback_guest_to_host_ports: BTreeMap<(JavascriptSocketFamily, u16), u16>,
