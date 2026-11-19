@@ -3118,6 +3118,16 @@ await globalThis.__agentOSWasmRunnerRun();"#
     )
 }
 
+/// Opt-in: a WebAssembly parent that only waits for its children sleeps up to
+/// 1 ms between poll sweeps. This removes poll requests from the dispatcher,
+/// but an event that the parent must pull (stream data, exit, or a request of
+/// a child that the supervisor does not service) can wait for that sleep.
+fn wasm_idle_child_pump_park_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("AGENTOS_WASM_IDLE_CHILD_PARK").as_deref() == Ok("1"))
+}
+
 fn build_wasm_runner_bootstrap(
     internal_env: &BTreeMap<String, String>,
     warmup_metrics: Option<&[u8]>,
@@ -3129,10 +3139,12 @@ fn build_wasm_runner_bootstrap(
     let env_merge_source = wasm_internal_env_merge_source();
     let wasm_sync_rpc_read_payload_bytes =
         max_cbor_byte_string_payload_bytes(WASM_PROCESS_SYNC_RPC_RESPONSE_BYTES);
+    let wasm_idle_child_pump_park = wasm_idle_child_pump_park_enabled();
 
     format!(
         r#"const __agentOSWasmInternalEnv = {internal_env_json};
 const __agentOSWasmSyncRpcReadPayloadBytes = {wasm_sync_rpc_read_payload_bytes};
+const __agentOSWasmIdleChildPumpPark = {wasm_idle_child_pump_park};
 const __agentOSRequireBuiltin = (specifier) => {{
   if (typeof globalThis.require === "function") {{
     return globalThis.require(specifier);
