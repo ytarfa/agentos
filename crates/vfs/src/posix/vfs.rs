@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use web_time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +24,46 @@ pub const RENAME_WHITEOUT: u32 = 4;
 // constants reserved for synthetic device and pipe stats.
 static NEXT_MEMORY_FILESYSTEM_DEVICE_ID: AtomicU64 = AtomicU64::new(256);
 static NEXT_RENAME_EXCHANGE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_NAMESPACE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_namespace_generation() -> u64 {
+    NEXT_NAMESPACE_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Path map of a `MemoryFileSystem`. Each mutable access takes a new
+/// process-wide generation, so a cache of path resolution results can detect
+/// every change of the namespace without a hook in each mutating operation.
+/// Path resolution depends only on this map, on the inode kinds, and on the
+/// symlink targets. The last two never change for a live inode.
+#[derive(Debug)]
+struct PathIndex {
+    entries: BTreeMap<String, u64>,
+    generation: u64,
+}
+
+impl PathIndex {
+    fn new(entries: BTreeMap<String, u64>) -> Self {
+        Self {
+            entries,
+            generation: allocate_namespace_generation(),
+        }
+    }
+}
+
+impl Deref for PathIndex {
+    type Target = BTreeMap<String, u64>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl DerefMut for PathIndex {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.generation = allocate_namespace_generation();
+        &mut self.entries
+    }
+}
 
 fn allocate_memory_filesystem_device_id() -> u64 {
     NEXT_MEMORY_FILESYSTEM_DEVICE_ID.fetch_add(1, Ordering::Relaxed)
@@ -783,7 +825,7 @@ pub struct MemoryFileSystemSnapshot {
 #[derive(Debug)]
 pub struct MemoryFileSystem {
     device_id: u64,
-    path_index: BTreeMap<String, u64>,
+    path_index: PathIndex,
     inodes: BTreeMap<u64, Inode>,
     next_ino: u64,
 }
@@ -792,7 +834,7 @@ impl MemoryFileSystem {
     pub fn new() -> Self {
         let mut filesystem = Self {
             device_id: allocate_memory_filesystem_device_id(),
-            path_index: BTreeMap::new(),
+            path_index: PathIndex::new(BTreeMap::new()),
             inodes: BTreeMap::new(),
             next_ino: 1,
         };
@@ -800,6 +842,13 @@ impl MemoryFileSystem {
         let root_ino = filesystem.allocate_inode(InodeKind::Directory, S_IFDIR | 0o755);
         filesystem.path_index.insert(String::from("/"), root_ino);
         filesystem
+    }
+
+    /// Returns a value that changes on every change of the path namespace
+    /// (create, remove, rename, link, symlink). The value is unique in the
+    /// process, so two filesystems never report the same generation.
+    pub fn namespace_generation(&self) -> u64 {
+        self.path_index.generation
     }
 
     pub fn read_dir_filtered_limited<F>(
@@ -948,32 +997,34 @@ impl MemoryFileSystem {
         follow_final_symlink: bool,
         depth: usize,
     ) -> VfsResult<String> {
-        validate_path(path)?;
+        if path.as_bytes().contains(&0) {
+            return Err(VfsError::invalid_input("path contains NUL byte"));
+        }
+        let normalized = normalize_path_cow(path);
+        if normalized.len() > MAX_PATH_LENGTH {
+            return Err(VfsError::path_too_long(path));
+        }
         if depth > MAX_SYMLINK_DEPTH {
             return Err(VfsError::symlink_loop(path));
         }
-
-        let normalized = normalize_path(path);
         if normalized == "/" {
-            return Ok(normalized);
+            return Ok(normalized.into_owned());
         }
 
-        let components: Vec<&str> = normalized
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .collect();
-        let mut current = String::from("/");
+        // `normalized` is "/a/b/c". `current` grows by one component for each
+        // step, so one buffer serves all the lookups.
+        let mut current = String::with_capacity(normalized.len());
+        let mut consumed = 0;
 
-        for (index, component) in components.iter().enumerate() {
-            let candidate = if current == "/" {
-                format!("/{}", component)
-            } else {
-                format!("{current}/{}", component)
-            };
-            let is_final = index + 1 == components.len();
+        for component in normalized[1..].split('/') {
+            let parent_len = current.len();
+            current.push('/');
+            current.push_str(component);
+            consumed += 1 + component.len();
+            let is_final = consumed == normalized.len();
             let should_follow = !is_final || follow_final_symlink;
 
-            if let Some(ino) = self.path_index.get(&candidate) {
+            if let Some(ino) = self.path_index.get(current.as_str()) {
                 let inode = self
                     .inodes
                     .get(ino)
@@ -984,12 +1035,17 @@ impl MemoryFileSystem {
                         let target_path = if target.starts_with('/') {
                             target.clone()
                         } else {
-                            normalize_path(&format!("{}/{}", dirname(&candidate), target))
+                            let parent = if parent_len == 0 {
+                                "/"
+                            } else {
+                                &current[..parent_len]
+                            };
+                            normalize_path(&format!("{parent}/{target}"))
                         };
-                        let remainder = components[index + 1..].join("/");
-                        let next_path = if remainder.is_empty() {
+                        let next_path = if is_final {
                             target_path
                         } else {
+                            let remainder = &normalized[consumed + 1..];
                             normalize_path(&format!("{target_path}/{remainder}"))
                         };
                         return self.resolve_path_with_options(
@@ -1001,11 +1057,9 @@ impl MemoryFileSystem {
                 }
 
                 if !is_final && !matches!(inode.kind, InodeKind::Directory) {
-                    return Err(VfsError::not_directory("stat", &candidate));
+                    return Err(VfsError::not_directory("stat", &current));
                 }
             }
-
-            current = candidate;
         }
 
         Ok(current)
@@ -1025,7 +1079,7 @@ impl MemoryFileSystem {
         op: &'static str,
         follow_symlinks: bool,
     ) -> VfsResult<u64> {
-        let normalized = normalize_path(path);
+        let normalized = normalize_path_cow(path);
         let resolved = if follow_symlinks {
             self.resolve_path(&normalized, 0)?
         } else {
@@ -1187,7 +1241,7 @@ impl MemoryFileSystem {
     /// byte and inode limits before reaching this raw clone operation.
     pub fn snapshot(&self) -> MemoryFileSystemSnapshot {
         MemoryFileSystemSnapshot {
-            path_index: self.path_index.clone(),
+            path_index: self.path_index.entries.clone(),
             inodes: self
                 .inodes
                 .iter()
@@ -1245,7 +1299,7 @@ impl MemoryFileSystem {
     pub fn from_snapshot(snapshot: MemoryFileSystemSnapshot) -> Self {
         Self {
             device_id: allocate_memory_filesystem_device_id(),
-            path_index: snapshot.path_index,
+            path_index: PathIndex::new(snapshot.path_index),
             inodes: snapshot
                 .inodes
                 .into_iter()
@@ -2223,16 +2277,41 @@ pub fn validate_path(path: &str) -> VfsResult<()> {
     if path.as_bytes().contains(&0) {
         return Err(VfsError::invalid_input("path contains NUL byte"));
     }
-    let normalized = normalize_path(path);
-    if normalized.len() > MAX_PATH_LENGTH {
+    if normalize_path_cow(path).len() > MAX_PATH_LENGTH {
         return Err(VfsError::path_too_long(path));
     }
     Ok(())
 }
 
+/// Returns true when `normalize_path` returns `path` without a change.
+fn is_normalized_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.first() != Some(&b'/') {
+        return false;
+    }
+    if bytes.len() == 1 {
+        return true;
+    }
+    bytes[1..]
+        .split(|byte| *byte == b'/')
+        .all(|component| !matches!(component, b"" | b"." | b".."))
+}
+
+/// `normalize_path` without an allocation for a path that is already normal.
+pub fn normalize_path_cow(path: &str) -> Cow<'_, str> {
+    if is_normalized_path(path) {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(normalize_path(path))
+    }
+}
+
 pub fn normalize_path(path: &str) -> String {
     if path.is_empty() {
         return String::from("/");
+    }
+    if is_normalized_path(path) {
+        return path.to_owned();
     }
 
     let candidate = if path.starts_with('/') {
